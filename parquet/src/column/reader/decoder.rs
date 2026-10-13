@@ -228,6 +228,7 @@ impl<T: DataType> ColumnValueDecoder for ColumnValueDecoderImpl<T> {
         Ok(())
     }
 
+    #[expect(clippy::uninit_vec)]
     fn read(&mut self, out: &mut Self::Buffer, num_values: usize) -> Result<usize> {
         let encoding = self
             .current_encoding
@@ -239,7 +240,21 @@ impl<T: DataType> ColumnValueDecoder for ColumnValueDecoderImpl<T> {
 
         // TODO: Push vec into decoder (#5177)
         let start = out.len();
-        out.resize(start + num_values, T::T::default());
+        // The decoder overwrites `read` values of the freshly grown region and the
+        // remainder is truncated below, so there is no need to zero-initialise it for
+        // primitive element types. Avoiding the `Vec::resize` memset is worthwhile for
+        // wide, e.g. dictionary-encoded, pages. For types that drop (e.g. `ByteArray`)
+        // the uninitialised region would be dropped by `truncate`, so fall back to the
+        // safe zero-initialising path.
+        if std::mem::needs_drop::<T::T>() {
+            out.resize(start + num_values, T::T::default());
+        } else {
+            out.reserve(num_values);
+            // SAFETY: `T::T` has no destructor (checked above) and the decoder writes
+            // every value in `out[start..start + read]` before `truncate` removes the
+            // (still uninitialised) tail, so no uninitialised element is ever read.
+            unsafe { out.set_len(start + num_values) };
+        }
         let read = current_decoder.get(&mut out[start..])?;
         out.truncate(start + read);
         Ok(read)
@@ -317,6 +332,7 @@ impl ColumnLevelDecoder for DefinitionLevelDecoderImpl {
 }
 
 impl DefinitionLevelDecoder for DefinitionLevelDecoderImpl {
+    #[expect(clippy::uninit_vec)]
     fn read_def_levels(
         &mut self,
         out: &mut Self::Buffer,
@@ -324,7 +340,12 @@ impl DefinitionLevelDecoder for DefinitionLevelDecoderImpl {
     ) -> Result<(usize, usize)> {
         // TODO: Push vec into decoder (#5177)
         let start = out.len();
-        out.resize(start + num_levels, 0);
+        // `i16` never drops, so avoid the `resize` memset; the decoder fills the
+        // region and it is truncated below (see `ColumnValueDecoderImpl::read`).
+        out.reserve(num_levels);
+        // SAFETY: `i16` has no destructor; the decoder initialises
+        // `out[start..start + levels_read]` before the uninitialised tail is removed.
+        unsafe { out.set_len(start + num_levels) };
         let levels_read = self.decoder.as_mut().unwrap().read(&mut out[start..])?;
         out.truncate(start + levels_read);
 
