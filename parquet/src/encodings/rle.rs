@@ -34,7 +34,7 @@
 //! repeated-value := value that is repeated, using a fixed-width of
 //! round-up-to-next-byte(bit-width)
 
-use std::{cmp, mem::size_of};
+use std::{cmp, mem::MaybeUninit, mem::size_of};
 
 use bytes::Bytes;
 
@@ -642,6 +642,127 @@ impl RleDecoder {
                             }
                             // SAFETY: bounds checked above
                             b.clone_from(unsafe { dict.get_unchecked(dict_idx) });
+                        }
+                    }
+                    self.bit_packed_left -= num_values as u32;
+                    values_read += num_values;
+                    if num_values < to_read {
+                        break;
+                    }
+                }
+            } else if !self.reload()? {
+                break;
+            }
+        }
+
+        Ok(values_read)
+    }
+
+    /// Decodes up to `max_values` values into `out`, writing each decoded value
+    /// into a [`MaybeUninit`] slot so the caller does not have to pre-fill the
+    /// buffer with a default value.
+    ///
+    /// Shares the exact bounds-check and dispatch logic with
+    /// [`Self::get_batch_with_dict`]: the same flat u32 max-reduction for the
+    /// dictionary index bounds check, the same `dict.len() >= 2^bit_width`
+    /// check-skip, and the same chunked unchecked gather. On success exactly
+    /// `out[..read]` is initialized; `out[read..]` is unspecified.
+    #[inline(never)]
+    pub fn get_batch_with_dict_maybe_uninit<T>(
+        &mut self,
+        dict: &[T],
+        out: &mut [MaybeUninit<T>],
+        max_values: usize,
+    ) -> Result<usize>
+    where
+        T: Default + Clone,
+    {
+        debug_assert!(out.len() >= max_values);
+
+        let mut values_read = 0;
+        while values_read < max_values {
+            let index_buf = self.index_buf.get_or_insert_with(|| Box::new([0; 1024]));
+
+            if self.rle_left > 0 {
+                let num_values = cmp::min(max_values - values_read, self.rle_left as usize);
+                let dict_idx = self.current_value.unwrap() as usize;
+                let dict_value = dict
+                    .get(dict_idx)
+                    .ok_or_else(|| {
+                        general_err!(
+                            "dictionary index out of bounds: the len is {} but the index is {}",
+                            dict.len(),
+                            dict_idx
+                        )
+                    })?
+                    .clone();
+
+                for slot in &mut out[values_read..values_read + num_values] {
+                    slot.write(dict_value.clone());
+                }
+
+                self.rle_left -= num_values as u32;
+                values_read += num_values;
+            } else if self.bit_packed_left > 0 {
+                let bit_reader = self
+                    .bit_reader
+                    .as_mut()
+                    .ok_or_else(|| general_err!("bit_reader should be set"))?;
+
+                loop {
+                    let to_read = index_buf
+                        .len()
+                        .min(max_values - values_read)
+                        .min(self.bit_packed_left as usize);
+
+                    if to_read == 0 {
+                        break;
+                    }
+
+                    let num_values = bit_reader
+                        .get_batch::<i32>(&mut index_buf[..to_read], self.bit_width as usize);
+                    if num_values == 0 {
+                        // Handle writers which truncate the final block
+                        self.bit_packed_left = 0;
+                        break;
+                    }
+                    {
+                        #[cold]
+                        #[inline(never)]
+                        fn oob(max_idx: u32, dict_len: usize) -> ParquetError {
+                            general_err!(
+                                "dictionary index out of bounds: the len is {} but the index is {}",
+                                dict_len,
+                                max_idx
+                            )
+                        }
+                        const CHUNK: usize = 16;
+                        let out = &mut out[values_read..values_read + num_values];
+                        let idx = &index_buf[..num_values];
+                        let dict_len = dict.len();
+                        let (out_chunks, out_chunks_remainder) = out.as_chunks_mut::<CHUNK>();
+                        let (idx_chunks, idx_chunks_remainder) = idx.as_chunks::<CHUNK>();
+                        for (out_chunk, idx_chunk) in out_chunks.iter_mut().zip(idx_chunks) {
+                            // u32 max-reduction instead of `.all(|&i| ..)`: `.all`
+                            // short-circuits and blocks autovectorisation. Negative
+                            // i32 cast to u32 becomes a large value so the bounds
+                            // check still rejects it.
+                            let max_idx = idx_chunk.iter().fold(0u32, |acc, &i| acc.max(i as u32));
+                            if (max_idx as usize) >= dict_len {
+                                return Err(oob(max_idx, dict_len));
+                            }
+                            for (b, i) in out_chunk.iter_mut().zip(idx_chunk.iter()) {
+                                // SAFETY: all indices checked above to be in bounds
+                                b.write(unsafe { dict.get_unchecked(*i as usize) }.clone());
+                            }
+                        }
+                        for (b, i) in out_chunks_remainder.iter_mut().zip(idx_chunks_remainder) {
+                            let dict_idx = *i as usize;
+                            if dict_idx >= dict_len {
+                                return Err(oob(*i as u32, dict_len));
+                            }
+                            // SAFETY: bounds checked above
+                            b.write(unsafe { dict.get_unchecked(dict_idx) }.clone());
                         }
                     }
                     self.bit_packed_left -= num_values as u32;
@@ -1317,5 +1438,172 @@ mod tests {
             assert!(bit_width < 64);
             test_round_trip(&values[..], bit_width);
         }
+    }
+
+    /// Encodes `indices` with `RleEncoder` for the given `bit_width`, producing the
+    /// exact byte stream a dictionary-encoded page would contain.
+    fn encode_indices(indices: &[u64], bit_width: u8) -> Bytes {
+        let mut encoder = RleEncoder::new(bit_width, 64 * 1024);
+        for &i in indices {
+            encoder.put(i);
+        }
+        encoder.consume().into()
+    }
+
+    /// Interpret the initialized prefix `out[..read]` as `&[T]`.
+    ///
+    /// # Safety
+    /// The caller must guarantee `out[..read]` has been initialized.
+    #[inline]
+    unsafe fn into_init<T>(out: &[MaybeUninit<T>], read: usize) -> &[T] {
+        // SAFETY: the caller guarantees `out[..read]` has been initialized.
+        unsafe { std::slice::from_raw_parts(out.as_ptr().cast::<T>(), read) }
+    }
+
+    #[test]
+    fn test_rle_get_batch_with_dict_maybe_uninit_mixed() {
+        // A single encoded stream containing an RLE run (eight 0s) followed by a
+        // bit-packed run (1,2,3,1,2,3,1,2). Dictionary values are all non-zero so
+        // an accidental default fill would be detectable.
+        let dict = vec![100, 200, 300, 400, 500, 600, 700, 800];
+        let bit_width = 3;
+        let indices: Vec<u64> = [0u64; 8]
+            .into_iter()
+            .chain([1, 2, 3, 1, 2, 3, 1, 2])
+            .collect();
+        let data = encode_indices(&indices, bit_width);
+
+        let expected: Vec<i32> = vec![100; 8]
+            .into_iter()
+            .chain([200, 300, 400, 200, 300, 400, 200, 300])
+            .collect();
+
+        let mut decoder = RleDecoder::new(bit_width);
+        decoder.set_data(data.clone()).unwrap();
+
+        let mut out = vec![MaybeUninit::<i32>::uninit(); indices.len()];
+        let read = decoder
+            .get_batch_with_dict_maybe_uninit(&dict, &mut out, indices.len())
+            .unwrap();
+        assert_eq!(read, indices.len());
+        // SAFETY: `out[..read]` was initialized by the decoder
+        assert_eq!(unsafe { into_init(&out, read) }, &expected[..]);
+    }
+
+    #[test]
+    fn test_rle_get_batch_with_dict_maybe_uninit_str() {
+        // Bit-packed run through the MaybeUninit path with a non-Copy `Clone` value.
+        let dict = vec!["aaa", "bbb", "ccc", "ddd", "eee", "fff"];
+        let bit_width = 3;
+        let indices: Vec<u64> = vec![3, 4, 5, 3, 4, 5, 3, 4, 5, 4, 5, 5];
+        let data = encode_indices(&indices, bit_width);
+
+        let mut decoder = RleDecoder::new(bit_width);
+        decoder.set_data(data).unwrap();
+
+        let mut out = vec![MaybeUninit::<&str>::uninit(); indices.len()];
+        let read = decoder
+            .get_batch_with_dict_maybe_uninit(&dict, &mut out, indices.len())
+            .unwrap();
+        assert_eq!(read, indices.len());
+        let decoded: Vec<&str> = indices.iter().map(|&i| dict[i as usize]).collect();
+        // SAFETY: `out[..read]` was initialized by the decoder
+        assert_eq!(unsafe { into_init(&out, read) }, &decoded[..]);
+    }
+
+    #[test]
+    fn test_rle_truncated_maybe_uninit() {
+        // The final bit packed run within a page may not be a multiple of 8 values.
+        let mut data: Vec<u8> = vec![(3 << 1) | 1];
+        data.extend(std::iter::repeat_n(0xFF, 20));
+        let data: Bytes = data.into();
+
+        let mut decoder = RleDecoder::new(8);
+        decoder.set_data(data).unwrap();
+        let dict: Vec<u16> = (0..256).collect();
+        let mut out = vec![MaybeUninit::<u16>::uninit(); 100];
+        let read = decoder
+            .get_batch_with_dict_maybe_uninit(&dict, &mut out, 100)
+            .unwrap();
+        assert_eq!(read, 20);
+        // SAFETY: `out[..read]` was initialized by the decoder
+        assert!(
+            unsafe { into_init(&out, read) }
+                .iter()
+                .take(20)
+                .all(|x| *x == 255)
+        );
+    }
+
+    #[test]
+    fn test_rle_oob_dict_maybe_uninit() {
+        // A dictionary index that is out of bounds must error identically to the
+        // regular `get_batch_with_dict` path.
+        let dict = vec![10, 20];
+        let bit_width = 2;
+        let indices: Vec<u64> = vec![0, 1, 2];
+        let data = encode_indices(&indices, bit_width);
+
+        let mut decoder = RleDecoder::new(bit_width);
+        decoder.set_data(data.clone()).unwrap();
+        let mut init = vec![0i32; indices.len()];
+        let err_init = decoder
+            .get_batch_with_dict(&dict, &mut init, indices.len())
+            .unwrap_err()
+            .to_string();
+
+        decoder.set_data(data).unwrap();
+        let mut out = vec![MaybeUninit::<i32>::uninit(); indices.len()];
+        let err_uninit = decoder
+            .get_batch_with_dict_maybe_uninit(&dict, &mut out, indices.len())
+            .unwrap_err()
+            .to_string();
+
+        assert_eq!(err_init, err_uninit);
+        assert!(err_uninit.contains("dictionary index out of bounds"));
+    }
+
+    #[test]
+    fn test_rle_short_read_maybe_uninit() {
+        // Only three RLE-encoded values are present but we ask for eight: the
+        // decoder stops at the end of the stream, returning a short read.
+        let dict = vec![10, 20, 30];
+        let bit_width = 2;
+        let indices: Vec<u64> = vec![0, 0, 0];
+        let data = encode_indices(&indices, bit_width);
+
+        let mut decoder = RleDecoder::new(bit_width);
+        decoder.set_data(data).unwrap();
+        let mut out = vec![MaybeUninit::<i32>::uninit(); 8];
+        let read = decoder
+            .get_batch_with_dict_maybe_uninit(&dict, &mut out, 8)
+            .unwrap();
+        assert_eq!(read, 3);
+        // SAFETY: `out[..read]` was initialized by the decoder
+        assert_eq!(unsafe { into_init(&out, read) }, &[10, 10, 10]);
+    }
+
+    #[test]
+    fn test_rle_dict_larger_than_index_space_maybe_uninit() {
+        // With `dict.len() == 2^bit_width`, every possible index is a valid
+        // dictionary entry, so the bounds check never fires. Verify the uninit
+        // path decodes each possible index correctly.
+        let bit_width = 3;
+        let dict: Vec<i32> = (100..108).collect();
+        let indices: Vec<u64> = (0..8).collect();
+        let data = encode_indices(&indices, bit_width);
+
+        let mut decoder = RleDecoder::new(bit_width);
+        decoder.set_data(data).unwrap();
+        let mut out = vec![MaybeUninit::<i32>::uninit(); 8];
+        let read = decoder
+            .get_batch_with_dict_maybe_uninit(&dict, &mut out, 8)
+            .unwrap();
+        assert_eq!(read, 8);
+        // SAFETY: `out[..read]` was initialized by the decoder
+        assert_eq!(
+            unsafe { into_init(&out, read) },
+            &[100, 101, 102, 103, 104, 105, 106, 107]
+        );
     }
 }

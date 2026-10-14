@@ -19,7 +19,7 @@
 
 use bytes::Bytes;
 use num_traits::{FromPrimitive, WrappingAdd};
-use std::{cmp, marker::PhantomData, mem};
+use std::{cmp, marker::PhantomData, mem, mem::MaybeUninit};
 
 use super::rle::{MAX_RLE_DICTIONARY_BIT_WIDTH, RleDecoder};
 
@@ -186,6 +186,27 @@ pub trait Decoder<T: DataType>: Send {
     /// `buffer.len()` unless the remaining number of values is less than
     /// `buffer.len()`.
     fn get(&mut self, buffer: &mut [T::T]) -> Result<usize>;
+
+    /// Decodes up to `out.len()` values into `out`, returning the number written.
+    ///
+    /// # Contract
+    /// - On `Ok(read)`, exactly `out[..read]` is initialized. `out[read..]` is
+    ///   unspecified: callers MUST NOT read it, and implementations MUST NOT
+    ///   rely on its prior contents (it may be uninitialized).
+    /// - On `Err`, no part of `out` may be assumed initialized.
+    ///
+    /// The default implementation initializes the whole buffer with
+    /// `Default::default()` and delegates to [`Self::get`], i.e. it leaves the
+    /// *entire* buffer initialized (a superset of the contract). Encodings
+    /// should override it to avoid the redundant fill.
+    fn get_maybe_uninit(&mut self, out: &mut [MaybeUninit<T::T>]) -> Result<usize> {
+        out.fill_with(|| MaybeUninit::new(T::T::default()));
+        // SAFETY: every element of `out` was initialized above with `MaybeUninit::new`,
+        // so it is valid to interpret the slice as `[T::T]`.
+        let init =
+            unsafe { std::slice::from_raw_parts_mut(out.as_mut_ptr().cast::<T::T>(), out.len()) };
+        self.get(init)
+    }
 
     /// Consume values from this decoder and write the results to `buffer`, leaving
     /// "spaces" for null values.
@@ -410,6 +431,15 @@ impl<T: DataType> Decoder<T> for DictDecoder<T> {
         let rle = self.rle_decoder.as_mut().unwrap();
         let num_values = cmp::min(buffer.len(), self.num_values);
         rle.get_batch_with_dict(&self.dictionary[..], buffer, num_values)
+    }
+
+    fn get_maybe_uninit(&mut self, out: &mut [MaybeUninit<T::T>]) -> Result<usize> {
+        assert!(self.rle_decoder.is_some());
+        assert!(self.has_dictionary, "Must call set_dict() first!");
+
+        let rle = self.rle_decoder.as_mut().unwrap();
+        let num_values = cmp::min(out.len(), self.num_values);
+        rle.get_batch_with_dict_maybe_uninit(&self.dictionary[..], out, num_values)
     }
 
     /// Number of values left in this decoder stream
