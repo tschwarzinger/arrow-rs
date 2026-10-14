@@ -239,9 +239,12 @@ impl<T: DataType> ColumnValueDecoder for ColumnValueDecoderImpl<T> {
 
         // TODO: Push vec into decoder (#5177)
         let start = out.len();
-        out.resize(start + num_values, T::T::default());
-        let read = current_decoder.get(&mut out[start..])?;
-        out.truncate(start + read);
+        out.reserve(num_values);
+        let spare = out.spare_capacity_mut();
+        let read = current_decoder.get_maybe_uninit(&mut spare[..num_values])?;
+        // SAFETY: `get_maybe_uninit` returned `read`, so exactly `spare[..read]` is
+        // initialized. `start + read <= start + num_values <= capacity`.
+        unsafe { out.set_len(start + read) };
         Ok(read)
     }
 
