@@ -27,6 +27,8 @@ use crate::errors::{ParquetError, Result};
 use crate::schema::types::ColumnDescPtr;
 use crate::util::bit_util::{BitReader, num_required_bits};
 
+use std::mem::MaybeUninit;
+
 /// Decodes level data
 pub trait ColumnLevelDecoder {
     type Buffer;
@@ -290,6 +292,29 @@ impl LevelDecoder {
             Self::Rle(reader) => Ok(reader.get_batch(out)?),
         }
     }
+
+    /// Reads up to `out.len()` levels, writing each into a [`MaybeUninit`] slot so
+    /// the caller does not have to pre-fill the buffer.
+    ///
+    /// Mirrors [`Self::read`]; both underlying decoders only ever write to the
+    /// output, never reading its prior contents. On success exactly `out[..read]`
+    /// is initialized and `out[read..]` is unspecified.
+    fn get_maybe_uninit(&mut self, out: &mut [MaybeUninit<i16>]) -> Result<usize> {
+        // SAFETY: both `Packed` (`BitReader::get_batch`) and `Rle`
+        // (`RleDecoder::get_batch`) write every element they report as read and
+        // never read the buffer's prior contents, so reinterpreting the
+        // possibly-uninitialized output as `[i16]` for the duration of the
+        // delegated call is sound. `out[levels_read..]` is left unspecified as
+        // required by the `[i16]`-buffer contract used by `read_def_levels`.
+        let out =
+            unsafe { std::slice::from_raw_parts_mut(out.as_mut_ptr().cast::<i16>(), out.len()) };
+        match self {
+            Self::Packed(reader, bit_width) => {
+                Ok(reader.get_batch::<i16>(out, *bit_width as usize))
+            }
+            Self::Rle(reader) => Ok(reader.get_batch(out)?),
+        }
+    }
 }
 
 /// An implementation of [`DefinitionLevelDecoder`] for `[i16]`
@@ -327,9 +352,17 @@ impl DefinitionLevelDecoder for DefinitionLevelDecoderImpl {
     ) -> Result<(usize, usize)> {
         // TODO: Push vec into decoder (#5177)
         let start = out.len();
-        out.resize(start + num_levels, 0);
-        let levels_read = self.decoder.as_mut().unwrap().read(&mut out[start..])?;
-        out.truncate(start + levels_read);
+        out.reserve(num_levels);
+        let spare = out.spare_capacity_mut();
+        let levels_read = self
+            .decoder
+            .as_mut()
+            .unwrap()
+            .get_maybe_uninit(&mut spare[..num_levels])?;
+        // SAFETY: `get_maybe_uninit` returned `levels_read`, so exactly
+        // `spare[..levels_read]` is initialized. `start + levels_read <=
+        // start + num_levels <= capacity`.
+        unsafe { out.set_len(start + levels_read) };
 
         let iter = out.iter().skip(start);
         let values_read = iter.filter(|x| **x == self.max_level).count();
